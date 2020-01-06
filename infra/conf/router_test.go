@@ -58,7 +58,14 @@ func TestRouterConfig(t *testing.T) {
 				"balancers": [
 					{
 						"tag": "b1",
-						"selector": ["test"]
+						"selector": ["test"],
+						"strategy": "optimal",
+						"optimalSettings": {
+							"timeout": 1000,
+							"interval": 12000,
+							"url": "http://test.com",
+							"count": 1
+						}
 					}
 				]
 			}`,
@@ -69,6 +76,13 @@ func TestRouterConfig(t *testing.T) {
 					{
 						Tag:              "b1",
 						OutboundSelector: []string{"test"},
+						Strategy:         "optimal",
+						OptimalStrategyConfig: &router.BalancingOptimalStrategyConfig{
+							Timeout:  1000,
+							Interval: 12000,
+							Url:      "http://test.com",
+							Count:    1,
+						},
 					},
 				},
 				Rule: []*router.RoutingRule{
