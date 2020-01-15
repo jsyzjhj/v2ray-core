@@ -21,12 +21,15 @@ import (
 	"v2ray.com/core/features/outbound"
 )
 
+var optimalStrategyGlobalLock sync.Mutex
+
 // OptimalStrategy pick outbound by net speed
 type OptimalStrategy struct {
 	timeout       time.Duration
 	interval      time.Duration
 	url           *url.URL
 	count         uint32
+	globalLock    bool
 	obm           outbound.Manager
 	tag           string
 	tags          []string
@@ -64,6 +67,7 @@ func NewOptimalStrategy(config *BalancingOptimalStrategyConfig) *OptimalStrategy
 	} else {
 		s.count = config.Count
 	}
+	s.globalLock = config.GlobalLock
 
 	return s
 }
@@ -112,7 +116,13 @@ func (s *OptimalStrategy) run() error {
 	for i, tag := range tags {
 		result := &results[i]
 		result.tag = tag
-		go s.testOutboud(tag, result, count, &wg)
+		if s.globalLock {
+			go s.testOutboud(tag, result, count, &wg)
+		} else {
+			optimalStrategyGlobalLock.Lock()
+			s.testOutboud(tag, result, count, &wg)
+			optimalStrategyGlobalLock.Unlock()
+		}
 	}
 	wg.Wait()
 

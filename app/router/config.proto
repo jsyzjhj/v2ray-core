@@ -122,6 +122,7 @@ message BalancingOptimalStrategyConfig {
   uint32 interval = 2;
   string url = 3;
   uint32 count = 4;
+  bool global_lock = 5;
 }
 
 message BalancingRule {

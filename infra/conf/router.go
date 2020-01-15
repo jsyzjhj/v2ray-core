@@ -23,6 +23,7 @@ type BalancingOptimalStrategyConfig struct {
 	Interval uint32 `json:"interval,omitempty"`
 	URL      string `json:"url,omitempty"`
 	Count    uint32 `json:"count,omitempty"`
+	GlobalLock bool `json:"globalLock,omitempty"`
 }
 
 type BalancingRule struct {
@@ -46,6 +47,7 @@ func (r *BalancingRule) Build() (*router.BalancingRule, error) {
 		optimalStrategyConfig.Interval = r.OptimalStrategyConfig.Interval
 		optimalStrategyConfig.Url = r.OptimalStrategyConfig.URL
 		optimalStrategyConfig.Count = r.OptimalStrategyConfig.Count
+		optimalStrategyConfig.GlobalLock = r.OptimalStrategyConfig.GlobalLock
 	}
 
 	return &router.BalancingRule{
