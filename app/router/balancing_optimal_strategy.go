@@ -1,3 +1,5 @@
+// +build !confonly
+
 package router
 
 import (
@@ -7,47 +9,49 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
+	"sync"
 	"time"
-
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/task"
-	"v2ray.com/core/features/outbound"
 	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
+
+	"v2ray.com/core/common/task"
+	"v2ray.com/core/features/outbound"
 )
 
 // OptimalStrategy pick outbound by net speed
 type OptimalStrategy struct {
-	timeout  time.Duration
-	interval time.Duration
-	url      *url.URL
-	count    uint32
-	score    float64
-	obm      outbound.Manager
-	tag      string
-	tags     []string
-	periodic *task.Periodic
+	timeout       time.Duration
+	interval      time.Duration
+	url           *url.URL
+	count         uint32
+	obm           outbound.Manager
+	tag           string
+	tags          []string
+	periodic      *task.Periodic
+	periodicMutex sync.Mutex
 }
 
 // NewOptimalStrategy create new strategy
-func NewOptimalStrategy(config *OptimalStrategyConfig) *OptimalStrategy {
+func NewOptimalStrategy(config *BalancingOptimalStrategyConfig) *OptimalStrategy {
 	s := &OptimalStrategy{}
 	if config.Timeout == 0 {
 		s.timeout = time.Second * 5
 	} else {
-		s.timeout = time.Second * time.Duration(config.Timeout)
+		s.timeout = time.Millisecond * time.Duration(config.Timeout)
 	}
 	if config.Interval == 0 {
 		s.interval = time.Second * 60 * 10
 	} else {
-		s.interval = time.Second * time.Duration(config.Interval)
+		s.interval = time.Millisecond * time.Duration(config.Interval)
 	}
-	if config.URL == "" {
+	if config.Url == "" {
 		s.url, _ = url.Parse("https://www.google.com")
 	} else {
 		var err error
-		s.url, err = url.Parse(config.URL)
+		s.url, err = url.Parse(config.Url)
 		if err != nil {
 			panic(err)
 		}
@@ -60,7 +64,6 @@ func NewOptimalStrategy(config *OptimalStrategyConfig) *OptimalStrategy {
 	} else {
 		s.count = config.Count
 	}
-	s.score = 0
 
 	return s
 }
@@ -77,70 +80,120 @@ func (s *OptimalStrategy) PickOutbound(obm outbound.Manager, tags []string) stri
 	s.tags = tags
 
 	if s.periodic == nil {
-		s.periodic = &task.Periodic{
-			Interval: s.interval,
-			Execute:  s.run,
+		s.periodicMutex.Lock()
+		if s.periodic == nil {
+			s.tag = s.tags[0]
+			s.periodic = &task.Periodic{
+				Interval: s.interval,
+				Execute:  s.run,
+			}
+			go s.periodic.Start()
 		}
-		s.periodic.Start()
-		s.tag = s.tags[0]
-		return s.tag
+		s.periodicMutex.Unlock()
 	}
 
 	return s.tag
 }
 
+type optimalStrategyTestResult struct {
+	tag   string
+	score float64
+}
+
 // periodic execute function
 func (s *OptimalStrategy) run() error {
-	s.score = 0
+	tags := s.tags
+	count := s.count
 
-	for _, tag := range s.tags {
-		scores := make([]float64, 0, s.count)
-		go s.testOutboud(tag, scores)
+	results := make([]optimalStrategyTestResult, len(tags))
+
+	var wg sync.WaitGroup
+	wg.Add(len(tags))
+	for i, tag := range tags {
+		result := &results[i]
+		result.tag = tag
+		go s.testOutboud(tag, result, count, &wg)
 	}
+	wg.Wait()
+
+	sort.Slice(results, func(i, j int) bool {
+		// score scores in desc order
+		return results[i].score > results[j].score
+	})
+
+	s.tag = results[0].tag
+	newError(fmt.Sprintf("Balance OptimalStrategy now pick detour [%s](score: %.2f) from %s", results[0].tag, results[0].score, tags)).AtInfo().WriteToLog()
 
 	return nil
 }
 
 // Test outbound's network state with multi-round
-func (s *OptimalStrategy) testOutboud(tag string, scores []float64) {
-	// calculate average score and end test round
-	if len(scores) >= int(s.count) {
-		var minScore float64 = float64(math.MaxInt64)
-		var maxScore float64 = float64(math.MinInt64)
-		var sumScore float64
-		var score float64
-
-		for _, score := range scores {
-			if score < minScore {
-				minScore = score
-			}
-			if score > maxScore {
-				maxScore = score
-			}
-			sumScore += score
-		}
-		if len(scores) < 3 {
-			score = sumScore / float64(len(scores))
-		} else {
-			score = (sumScore - minScore - maxScore) / float64(s.count-2)
-		}
-		newError(fmt.Sprintf("Balance OptimalStrategy get %s's score: %.2f", tag, score)).AtDebug().WriteToLog()
-
-		if s.score < score {
-			s.score = score
-			s.tag = tag
-			newError(fmt.Sprintf("Balance OptimalStrategy now pick detour [%s](score: %.2f) from %s", s.tag, s.score, s.tags)).AtInfo().WriteToLog()
-		}
-		return
-	}
+func (s *OptimalStrategy) testOutboud(tag string, result *optimalStrategyTestResult, count uint32, wg *sync.WaitGroup) {
 	// test outbound by fetch url
+	defer wg.Done()
+
 	oh := s.obm.GetHandler(tag)
 	if oh == nil {
 		newError("Wrong OptimalStrategy tag").AtError().WriteToLog()
 		return
 	}
 
-	client := &http.Client{
+	scores := make([]float64, count)
+	for i := uint32(0); i < count; i++ {
+		client := s.buildClient(oh)
+		// send http request though this outbound
+		req, _ := http.NewRequest("GET", s.url.String(), nil)
+		startAt := time.Now()
+		resp, err := client.Do(req)
+		// use http response speed or time(no http content) as score
+		score := 0.0
+		if err != nil {
+			newError(err).AtError().WriteToLog()
+		} else {
+			contentSize := 0
+			scanner := bufio.NewScanner(resp.Body)
+			for scanner.Scan() {
+				contentSize += len(scanner.Bytes())
+			}
+			finishAt := time.Now()
+			if contentSize != 0 {
+				score = float64(contentSize) / (float64(finishAt.UnixNano()-startAt.UnixNano()) / float64(time.Second))
+			} else {
+				// assert http header's Byte size is 100B
+				score = 100 / (float64(finishAt.UnixNano()-startAt.UnixNano()) / float64(time.Second))
+			}
+		}
+		scores[i] = score
+		// next test round
+		client.CloseIdleConnections()
+	}
+
+	// calculate average score and end test round
+	var minScore float64 = float64(math.MaxInt64)
+	var maxScore float64 = float64(math.MinInt64)
+	var sumScore float64
+	var score float64
+
+	for _, score := range scores {
+		if score < minScore {
+			minScore = score
+		}
+		if score > maxScore {
+			maxScore = score
+		}
+		sumScore += score
+	}
+	if len(scores) < 3 {
+		score = sumScore / float64(len(scores))
+	} else {
+		score = (sumScore - minScore - maxScore) / float64(s.count-2)
+	}
+	newError(fmt.Sprintf("Balance OptimalStrategy get %s's score: %.2f", tag, score)).AtDebug().WriteToLog()
+	result.score = score
+}
+
+func (s *OptimalStrategy) buildClient(oh outbound.Handler) *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				netDestination, err := net.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
@@ -159,36 +212,11 @@ func (s *OptimalStrategy) testOutboud(tag string, scores []float64) {
 
 				return net.NewConnection(net.ConnectionInputMulti(uplinkWriter), net.ConnectionOutputMulti(downlinkReader)), nil
 			},
-			MaxConnsPerHost: 1,
-			MaxIdleConns:    1,
+			MaxConnsPerHost:    1,
+			MaxIdleConns:       1,
+			DisableCompression: true,
+			DisableKeepAlives:  true,
 		},
 		Timeout: s.timeout,
 	}
-	startAt := time.Now()
-	// send http request though this outbound
-	req, _ := http.NewRequest("GET", s.url.String(), nil)
-	resp, err := client.Do(req)
-	// use http response speed or time(no http content) as score
-	score := 0.0
-	if err != nil {
-		newError(err).AtError().WriteToLog()
-	} else {
-		contentSize := 0
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			contentSize += len(scanner.Bytes())
-		}
-		if contentSize != 0 {
-			score = float64(contentSize) / (float64(time.Now().UnixNano()-startAt.UnixNano()) / float64(time.Second))
-		} else {
-			// assert http header's Byte size is 100B
-			score = 100 / (float64(time.Now().UnixNano()-startAt.UnixNano()) / float64(time.Second))
-		}
-	}
-	// next test round
-	client.CloseIdleConnections()
-	s.testOutboud(
-		tag,
-		append(scores, score),
-	)
 }

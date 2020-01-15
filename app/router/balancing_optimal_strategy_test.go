@@ -50,19 +50,12 @@ Connection: Closed
 	link.Writer.WriteMultiBuffer(buf.MergeBytes(buf.MultiBuffer{}, []byte(mockHTTPResponse)))
 }
 
-func TestRandomStrategy(t *testing.T) {
-	strategy := RandomStrategy{}
-	if strategy.PickOutbound(nil, []string{"test"}) != "test" {
-		t.Error("Random strategy test fail")
-	}
-}
-
 func TestOptimalStrategy(t *testing.T) {
 	ctx := context.Background()
 	obm, _ := outbound.New(ctx, nil)
 	obm.AddHandler(ctx, &mockHandler{tag: "test1", timeout: time.Millisecond * 100})
 	obm.AddHandler(ctx, &mockHandler{tag: "test2"})
-	strategy := NewOptimalStrategy(&OptimalStrategyConfig{URL: "http://test.com"})
+	strategy := NewOptimalStrategy(&BalancingOptimalStrategyConfig{Url: "http://test.com"})
 
 	tag := strategy.PickOutbound(obm, []string{"test1", "test2"})
 	if tag != "test1" {
