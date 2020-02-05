@@ -1,25 +1,21 @@
-// Package proxyman defines applications for manageing inbound and outbound proxies.
+// Package proxyman defines applications for managing inbound and outbound proxies.
 package proxyman
-
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg proxyman -path App,Proxyman
 
 import (
 	"context"
+
+	"v2ray.com/core/common/session"
 )
 
-type key int
-
-const (
-	protocolsKey key = iota
-)
-
-func ContextWithProtocolSniffers(ctx context.Context, list []KnownProtocols) context.Context {
-	return context.WithValue(ctx, protocolsKey, list)
-}
-
-func ProtocoSniffersFromContext(ctx context.Context) []KnownProtocols {
-	if list, ok := ctx.Value(protocolsKey).([]KnownProtocols); ok {
-		return list
+// ContextWithSniffingConfig is a wrapper of session.ContextWithContent.
+// Deprecated. Use session.ContextWithContent directly.
+func ContextWithSniffingConfig(ctx context.Context, c *SniffingConfig) context.Context {
+	content := session.ContentFromContext(ctx)
+	if content == nil {
+		content = new(session.Content)
+		ctx = session.ContextWithContent(ctx, content)
 	}
-	return nil
+	content.SniffingRequest.Enabled = c.Enabled
+	content.SniffingRequest.OverrideDestinationForProtocol = c.DestinationOverride
+	return ctx
 }

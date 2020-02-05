@@ -1,6 +1,8 @@
+// +build !confonly
+
 package log
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg log -path App,Log
+//go:generate errorgen
 
 import (
 	"context"
@@ -10,7 +12,7 @@ import (
 	"v2ray.com/core/common/log"
 )
 
-// Instance is an app.Application that handles logs.
+// Instance is a log.Handler that handles logs.
 type Instance struct {
 	sync.RWMutex
 	config       *Config
@@ -23,68 +25,78 @@ type Instance struct {
 func New(ctx context.Context, config *Config) (*Instance, error) {
 	g := &Instance{
 		config: config,
-		active: true,
-	}
-
-	if err := g.initAccessLogger(); err != nil {
-		return nil, newError("failed to initialize access logger").Base(err).AtWarning()
-	}
-	if err := g.initErrorLogger(); err != nil {
-		return nil, newError("failed to initialize error logger").Base(err).AtWarning()
+		active: false,
 	}
 	log.RegisterHandler(g)
 
+	// start logger instantly on inited
+	// other modules would log during init
+	if err := g.startInternal(); err != nil {
+		return nil, err
+	}
+
+	newError("Logger started").AtDebug().WriteToLog()
 	return g, nil
 }
 
 func (g *Instance) initAccessLogger() error {
-	switch g.config.AccessLogType {
-	case LogType_File:
-		creator, err := log.CreateFileLogWriter(g.config.AccessLogPath)
-		if err != nil {
-			return err
-		}
-		g.accessLogger = log.NewLogger(creator)
-	case LogType_Console:
-		g.accessLogger = log.NewLogger(log.CreateStdoutLogWriter())
-	default:
+	handler, err := createHandler(g.config.AccessLogType, HandlerCreatorOptions{
+		Path: g.config.AccessLogPath,
+	})
+	if err != nil {
+		return err
 	}
+	g.accessLogger = handler
 	return nil
 }
 
 func (g *Instance) initErrorLogger() error {
-	switch g.config.ErrorLogType {
-	case LogType_File:
-		creator, err := log.CreateFileLogWriter(g.config.ErrorLogPath)
-		if err != nil {
-			return err
-		}
-		g.errorLogger = log.NewLogger(creator)
-	case LogType_Console:
-		g.errorLogger = log.NewLogger(log.CreateStdoutLogWriter())
-	default:
+	handler, err := createHandler(g.config.ErrorLogType, HandlerCreatorOptions{
+		Path: g.config.ErrorLogPath,
+	})
+	if err != nil {
+		return err
 	}
+	g.errorLogger = handler
 	return nil
 }
 
-// Start implements app.Application.Start().
-func (g *Instance) Start() error {
+// Type implements common.HasType.
+func (*Instance) Type() interface{} {
+	return (*Instance)(nil)
+}
+
+func (g *Instance) startInternal() error {
 	g.Lock()
 	defer g.Unlock()
+
+	if g.active {
+		return nil
+	}
+
 	g.active = true
+
+	if err := g.initAccessLogger(); err != nil {
+		return newError("failed to initialize access logger").Base(err).AtWarning()
+	}
+	if err := g.initErrorLogger(); err != nil {
+		return newError("failed to initialize error logger").Base(err).AtWarning()
+	}
+
 	return nil
 }
 
-func (g *Instance) isActive() bool {
-	g.RLock()
-	defer g.RUnlock()
-
-	return g.active
+// Start implements common.Runnable.Start().
+func (g *Instance) Start() error {
+	return g.startInternal()
 }
 
 // Handle implements log.Handler.
 func (g *Instance) Handle(msg log.Message) {
-	if !g.isActive() {
+	g.RLock()
+	defer g.RUnlock()
+
+	if !g.active {
 		return
 	}
 
@@ -102,12 +114,26 @@ func (g *Instance) Handle(msg log.Message) {
 	}
 }
 
-// Close implement app.Application.Close().
-func (g *Instance) Close() {
+// Close implements common.Closable.Close().
+func (g *Instance) Close() error {
+	newError("Logger closing").AtDebug().WriteToLog()
+
 	g.Lock()
 	defer g.Unlock()
 
+	if !g.active {
+		return nil
+	}
+
 	g.active = false
+
+	common.Close(g.accessLogger) // nolint: errcheck
+	g.accessLogger = nil
+
+	common.Close(g.errorLogger) // nolint: errcheck
+	g.errorLogger = nil
+
+	return nil
 }
 
 func init() {
