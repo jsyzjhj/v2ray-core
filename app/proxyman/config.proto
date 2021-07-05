@@ -2,16 +2,16 @@ syntax = "proto3";
 
 package v2ray.core.app.proxyman;
 option csharp_namespace = "V2Ray.Core.App.Proxyman";
-option go_package = "proxyman";
+option go_package = "v2ray.com/core/app/proxyman";
 option java_package = "com.v2ray.core.app.proxyman";
 option java_multiple_files = true;
 
-import "v2ray.com/core/common/net/address.proto";
-import "v2ray.com/core/common/net/port.proto";
-import "v2ray.com/core/transport/internet/config.proto";
+import "common/net/address.proto";
+import "common/net/port.proto";
+import "transport/internet/config.proto";
+import "common/serial/typed_message.proto";
 
-message InboundConfig {
-}
+message InboundConfig {}
 
 message AllocationStrategy {
   enum Type {
@@ -35,7 +35,6 @@ message AllocationStrategy {
   // Default value is 3 if unset.
   AllocationStrategyConcurrency concurrency = 2;
 
-
   message AllocationStrategyRefresh {
     uint32 value = 1;
   }
@@ -50,19 +49,37 @@ enum KnownProtocols {
   TLS = 1;
 }
 
+message SniffingConfig {
+  // Whether or not to enable content sniffing on an inbound connection.
+  bool enabled = 1;
+
+  // Override target destination if sniff'ed protocol is in the given list.
+  // Supported values are "http", "tls".
+  repeated string destination_override = 2;
+}
+
 message ReceiverConfig {
+  // PortRange specifies the ports which the Receiver should listen on.
   v2ray.core.common.net.PortRange port_range = 1;
+  // Listen specifies the IP address that the Receiver should listen on.
   v2ray.core.common.net.IPOrDomain listen = 2;
   AllocationStrategy allocation_strategy = 3;
   v2ray.core.transport.internet.StreamConfig stream_settings = 4;
   bool receive_original_destination = 5;
   reserved 6;
-  repeated KnownProtocols domain_override = 7;
+  // Override domains for the given protocol.
+  // Deprecated. Use sniffing_settings.
+  repeated KnownProtocols domain_override = 7 [deprecated = true];
+  SniffingConfig sniffing_settings = 8;
 }
 
-message OutboundConfig {
-  
+message InboundHandlerConfig {
+  string tag = 1;
+  v2ray.core.common.serial.TypedMessage receiver_settings = 2;
+  v2ray.core.common.serial.TypedMessage proxy_settings = 3;
 }
+
+message OutboundConfig {}
 
 message SenderConfig {
   // Send traffic through the given IP. Only IP is allowed.

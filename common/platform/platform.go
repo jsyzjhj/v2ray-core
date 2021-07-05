@@ -1,4 +1,4 @@
-package platform
+package platform // import "v2ray.com/core/common/platform"
 
 import (
 	"os"
@@ -10,6 +10,13 @@ import (
 type EnvFlag struct {
 	Name    string
 	AltName string
+}
+
+func NewEnvFlag(name string) EnvFlag {
+	return EnvFlag{
+		Name:    name,
+		AltName: NormalizeEnvName(name),
+	}
 }
 
 func (f EnvFlag) GetValue(defaultValue func() string) string {
@@ -53,26 +60,27 @@ func getExecutableDir() string {
 	return filepath.Dir(exec)
 }
 
-func getExecuableSubDir(dir string) func() string {
+func getExecutableSubDir(dir string) func() string {
 	return func() string {
 		return filepath.Join(getExecutableDir(), dir)
 	}
 }
 
-func GetAssetLocation(file string) string {
-	const name = "v2ray.location.asset"
-	assetPath := EnvFlag{Name: name, AltName: NormalizeEnvName(name)}.GetValue(getExecutableDir)
-	return filepath.Join(assetPath, file)
-}
-
 func GetPluginDirectory() string {
 	const name = "v2ray.location.plugin"
-	pluginDir := EnvFlag{Name: name, AltName: NormalizeEnvName(name)}.GetValue(getExecuableSubDir("plugins"))
+	pluginDir := NewEnvFlag(name).GetValue(getExecutableSubDir("plugins"))
 	return pluginDir
 }
 
 func GetConfigurationPath() string {
 	const name = "v2ray.location.config"
-	configPath := EnvFlag{Name: name, AltName: NormalizeEnvName(name)}.GetValue(getExecutableDir)
+	configPath := NewEnvFlag(name).GetValue(getExecutableDir)
 	return filepath.Join(configPath, "config.json")
+}
+
+// GetConfDirPath reads "v2ray.location.confdir"
+func GetConfDirPath() string {
+	const name = "v2ray.location.confdir"
+	configPath := NewEnvFlag(name).GetValue(func() string { return "" })
+	return configPath
 }

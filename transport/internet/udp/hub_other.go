@@ -1,14 +1,10 @@
-// +build !linux
+// +build !linux,!freebsd
 
 package udp
 
 import (
 	"v2ray.com/core/common/net"
 )
-
-func SetOriginalDestOptions(fd int) error {
-	return nil
-}
 
 func RetrieveOriginalDest(oob []byte) net.Destination {
 	return net.Destination{}

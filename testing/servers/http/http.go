@@ -9,7 +9,6 @@ import (
 type Server struct {
 	Port        net.Port
 	PathHandler map[string]http.HandlerFunc
-	accepting   bool
 	server      *http.Server
 }
 
@@ -36,6 +35,6 @@ func (s *Server) Start() (net.Destination, error) {
 	return net.TCPDestination(net.LocalHostIP, net.Port(s.Port)), nil
 }
 
-func (s *Server) Close() {
-	s.server.Close()
+func (s *Server) Close() error {
+	return s.server.Close()
 }

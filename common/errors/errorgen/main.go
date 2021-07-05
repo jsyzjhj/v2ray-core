@@ -1,49 +1,45 @@
-// +build generate
-
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
-	"strings"
+	"path/filepath"
 
 	"v2ray.com/core/common"
 )
 
-var (
-	pkg  = flag.String("pkg", "", "Target package")
-	path = flag.String("path", "", "Path")
-)
-
 func main() {
-	flag.Parse()
-
-	if len(*pkg) == 0 {
-		panic("Package is not specified.")
+	pwd, err := os.Getwd()
+	if err != nil {
+		fmt.Println("can not get current working directory")
+		os.Exit(1)
+	}
+	pkg := filepath.Base(pwd)
+	if pkg == "v2ray-core" {
+		pkg = "core"
 	}
 
-	if len(*path) == 0 {
-		panic("Path is not specified.")
+	moduleName, gmnErr := common.GetModuleName(pwd)
+	if gmnErr != nil {
+		fmt.Println("can not get module path", gmnErr)
+		os.Exit(1)
 	}
-
-	paths := strings.Split(*path, ",")
-	for i := range paths {
-		paths[i] = "\"" + paths[i] + "\""
-	}
-	pathStr := strings.Join(paths, ", ")
 
 	file, err := os.OpenFile("errors.generated.go", os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
 	if err != nil {
 		log.Fatalf("Failed to generate errors.generated.go: %v", err)
+		os.Exit(1)
 	}
+	defer file.Close()
 
-	common.Must2(fmt.Fprintln(file, "package", *pkg))
-	common.Must2(fmt.Fprintln(file, ""))
-	common.Must2(fmt.Fprintln(file, "import \"v2ray.com/core/common/errors\""))
-	common.Must2(fmt.Fprintln(file, ""))
-	common.Must2(fmt.Fprintln(file, "func newError(values ...interface{}) *errors.Error { return errors.New(values...).Path("+pathStr+") }"))
-
-	common.Must(file.Close())
+	fmt.Fprintln(file, "package", pkg)
+	fmt.Fprintln(file, "")
+	fmt.Fprintln(file, "import \""+moduleName+"/common/errors\"")
+	fmt.Fprintln(file, "")
+	fmt.Fprintln(file, "type errPathObjHolder struct{}")
+	fmt.Fprintln(file, "")
+	fmt.Fprintln(file, "func newError(values ...interface{}) *errors.Error {")
+	fmt.Fprintln(file, "	return errors.New(values...).WithPathObj(errPathObjHolder{})")
+	fmt.Fprintln(file, "}")
 }

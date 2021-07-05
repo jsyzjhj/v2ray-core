@@ -1,42 +1,61 @@
+// +build !confonly
+
 package shadowsocks
 
 import (
-	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"hash"
+	"hash/crc32"
 	"io"
+	"io/ioutil"
+	"v2ray.com/core/common/dice"
 
 	"v2ray.com/core/common"
-	"v2ray.com/core/common/bitmask"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
-	"v2ray.com/core/proxy/socks"
 )
 
 const (
-	Version                               = 1
-	RequestOptionOneTimeAuth bitmask.Byte = 0x01
+	Version = 1
+)
 
-	AddrTypeIPv4   = 1
-	AddrTypeIPv6   = 4
-	AddrTypeDomain = 3
+var addrParser = protocol.NewAddressParser(
+	protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
+	protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
+	protocol.AddressFamilyByte(0x03, net.AddressFamilyDomain),
+	protocol.WithAddressTypeParser(func(b byte) byte {
+		return b & 0x0F
+	}),
 )
 
 // ReadTCPSession reads a Shadowsocks TCP session from the given reader, returns its header and remaining parts.
-func ReadTCPSession(user *protocol.User, reader io.Reader) (*protocol.RequestHeader, buf.Reader, error) {
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, nil, newError("failed to parse account").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
+func ReadTCPSession(user *protocol.MemoryUser, reader io.Reader) (*protocol.RequestHeader, buf.Reader, error) {
+	account := user.Account.(*MemoryAccount)
 
-	buffer := buf.NewLocal(512)
+	hashkdf := hmac.New(func() hash.Hash { return sha256.New() }, []byte("SSBSKDF"))
+	hashkdf.Write(account.Key)
+
+	behaviorSeed := crc32.ChecksumIEEE(hashkdf.Sum(nil))
+
+	behaviorRand := dice.NewDeterministicDice(int64(behaviorSeed))
+	BaseDrainSize := behaviorRand.Roll(3266)
+	RandDrainMax := behaviorRand.Roll(64) + 1
+	RandDrainRolled := dice.Roll(RandDrainMax)
+	DrainSize := BaseDrainSize + 16 + 38 + RandDrainRolled
+	readSizeRemain := DrainSize
+
+	buffer := buf.New()
 	defer buffer.Release()
 
 	ivLen := account.Cipher.IVSize()
 	var iv []byte
 	if ivLen > 0 {
-		if err := buffer.AppendSupplier(buf.ReadFullFrom(reader, ivLen)); err != nil {
+		if _, err := buffer.ReadFullFrom(reader, ivLen); err != nil {
+			readSizeRemain -= int(buffer.Len())
+			DrainConnN(reader, readSizeRemain)
 			return nil, nil, newError("failed to read IV").Base(err)
 		}
 
@@ -45,117 +64,55 @@ func ReadTCPSession(user *protocol.User, reader io.Reader) (*protocol.RequestHea
 
 	r, err := account.Cipher.NewDecryptionReader(account.Key, iv, reader)
 	if err != nil {
+		readSizeRemain -= int(buffer.Len())
+		DrainConnN(reader, readSizeRemain)
 		return nil, nil, newError("failed to initialize decoding stream").Base(err).AtError()
 	}
-	br := buf.NewBufferedReader(r)
-	reader = nil
+	br := &buf.BufferedReader{Reader: r}
 
-	authenticator := NewAuthenticator(HeaderKeyGenerator(account.Key, iv))
 	request := &protocol.RequestHeader{
 		Version: Version,
 		User:    user,
 		Command: protocol.RequestCommandTCP,
 	}
 
-	if err := buffer.Reset(buf.ReadFullFrom(br, 1)); err != nil {
-		return nil, nil, newError("failed to read address type").Base(err)
-	}
+	readSizeRemain -= int(buffer.Len())
+	buffer.Clear()
 
-	if !account.Cipher.IsAEAD() {
-		if (buffer.Byte(0) & 0x10) == 0x10 {
-			request.Option.Set(RequestOptionOneTimeAuth)
-		}
-
-		if request.Option.Has(RequestOptionOneTimeAuth) && account.OneTimeAuth == Account_Disabled {
-			return nil, nil, newError("rejecting connection with OTA enabled, while server disables OTA")
-		}
-
-		if !request.Option.Has(RequestOptionOneTimeAuth) && account.OneTimeAuth == Account_Enabled {
-			return nil, nil, newError("rejecting connection with OTA disabled, while server enables OTA")
-		}
-	}
-
-	addrType := (buffer.Byte(0) & 0x0F)
-	switch addrType {
-	case AddrTypeIPv4:
-		if err := buffer.AppendSupplier(buf.ReadFullFrom(br, 4)); err != nil {
-			return nil, nil, newError("failed to read IPv4 address").Base(err)
-		}
-		request.Address = net.IPAddress(buffer.BytesFrom(-4))
-	case AddrTypeIPv6:
-		if err := buffer.AppendSupplier(buf.ReadFullFrom(br, 16)); err != nil {
-			return nil, nil, newError("failed to read IPv6 address").Base(err)
-		}
-		request.Address = net.IPAddress(buffer.BytesFrom(-16))
-	case AddrTypeDomain:
-		if err := buffer.AppendSupplier(buf.ReadFullFrom(br, 1)); err != nil {
-			return nil, nil, newError("failed to read domain lenth.").Base(err)
-		}
-		domainLength := int(buffer.BytesFrom(-1)[0])
-		err = buffer.AppendSupplier(buf.ReadFullFrom(br, domainLength))
-		if err != nil {
-			return nil, nil, newError("failed to read domain").Base(err)
-		}
-		request.Address = net.DomainAddress(string(buffer.BytesFrom(-domainLength)))
-	default:
-		// Check address validity after OTA verification.
-	}
-
-	err = buffer.AppendSupplier(buf.ReadFullFrom(br, 2))
+	addr, port, err := addrParser.ReadAddressPort(buffer, br)
 	if err != nil {
-		return nil, nil, newError("failed to read port").Base(err)
+		readSizeRemain -= int(buffer.Len())
+		DrainConnN(reader, readSizeRemain)
+		return nil, nil, newError("failed to read address").Base(err)
 	}
-	request.Port = net.PortFromBytes(buffer.BytesFrom(-2))
 
-	if request.Option.Has(RequestOptionOneTimeAuth) {
-		actualAuth := make([]byte, AuthSize)
-		authenticator.Authenticate(buffer.Bytes())(actualAuth)
-
-		err := buffer.AppendSupplier(buf.ReadFullFrom(br, AuthSize))
-		if err != nil {
-			return nil, nil, newError("Failed to read OTA").Base(err)
-		}
-
-		if !bytes.Equal(actualAuth, buffer.BytesFrom(-AuthSize)) {
-			return nil, nil, newError("invalid OTA")
-		}
-	}
+	request.Address = addr
+	request.Port = port
 
 	if request.Address == nil {
+		readSizeRemain -= int(buffer.Len())
+		DrainConnN(reader, readSizeRemain)
 		return nil, nil, newError("invalid remote address.")
 	}
 
-	br.SetBuffered(false)
+	return request, br, nil
+}
 
-	var chunkReader buf.Reader
-	if request.Option.Has(RequestOptionOneTimeAuth) {
-		chunkReader = NewChunkReader(br, NewAuthenticator(ChunkKeyGenerator(iv)))
-	} else {
-		chunkReader = buf.NewReader(br)
-	}
-
-	return request, chunkReader, nil
+func DrainConnN(reader io.Reader, n int) error {
+	_, err := io.CopyN(ioutil.Discard, reader, int64(n))
+	return err
 }
 
 // WriteTCPRequest writes Shadowsocks request into the given writer, and returns a writer for body.
 func WriteTCPRequest(request *protocol.RequestHeader, writer io.Writer) (buf.Writer, error) {
 	user := request.User
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, newError("failed to parse account").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
-
-	if account.Cipher.IsAEAD() {
-		request.Option.Clear(RequestOptionOneTimeAuth)
-	}
+	account := user.Account.(*MemoryAccount)
 
 	var iv []byte
 	if account.Cipher.IVSize() > 0 {
 		iv = make([]byte, account.Cipher.IVSize())
 		common.Must2(rand.Read(iv))
-		_, err = writer.Write(iv)
-		if err != nil {
+		if err := buf.WriteAllBytes(writer, iv); err != nil {
 			return nil, newError("failed to write IV")
 		}
 	}
@@ -165,45 +122,26 @@ func WriteTCPRequest(request *protocol.RequestHeader, writer io.Writer) (buf.Wri
 		return nil, newError("failed to create encoding stream").Base(err).AtError()
 	}
 
-	header := buf.NewLocal(512)
+	header := buf.New()
 
-	if err := socks.AppendAddress(header, request.Address, request.Port); err != nil {
+	if err := addrParser.WriteAddressPort(header, request.Address, request.Port); err != nil {
 		return nil, newError("failed to write address").Base(err)
 	}
 
-	if request.Option.Has(RequestOptionOneTimeAuth) {
-		header.SetByte(0, header.Byte(0)|0x10)
-
-		authenticator := NewAuthenticator(HeaderKeyGenerator(account.Key, iv))
-		common.Must(header.AppendSupplier(authenticator.Authenticate(header.Bytes())))
-	}
-
-	if err := w.WriteMultiBuffer(buf.NewMultiBufferValue(header)); err != nil {
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{header}); err != nil {
 		return nil, newError("failed to write header").Base(err)
 	}
 
-	var chunkWriter buf.Writer
-	if request.Option.Has(RequestOptionOneTimeAuth) {
-		chunkWriter = NewChunkWriter(w.(io.Writer), NewAuthenticator(ChunkKeyGenerator(iv)))
-	} else {
-		chunkWriter = w
-	}
-
-	return chunkWriter, nil
+	return w, nil
 }
 
-func ReadTCPResponse(user *protocol.User, reader io.Reader) (buf.Reader, error) {
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, newError("failed to parse account").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
+func ReadTCPResponse(user *protocol.MemoryUser, reader io.Reader) (buf.Reader, error) {
+	account := user.Account.(*MemoryAccount)
 
 	var iv []byte
 	if account.Cipher.IVSize() > 0 {
 		iv = make([]byte, account.Cipher.IVSize())
-		_, err = io.ReadFull(reader, iv)
-		if err != nil {
+		if _, err := io.ReadFull(reader, iv); err != nil {
 			return nil, newError("failed to read IV").Base(err)
 		}
 	}
@@ -213,18 +151,13 @@ func ReadTCPResponse(user *protocol.User, reader io.Reader) (buf.Reader, error) 
 
 func WriteTCPResponse(request *protocol.RequestHeader, writer io.Writer) (buf.Writer, error) {
 	user := request.User
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, newError("failed to parse account.").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
+	account := user.Account.(*MemoryAccount)
 
 	var iv []byte
 	if account.Cipher.IVSize() > 0 {
 		iv = make([]byte, account.Cipher.IVSize())
 		common.Must2(rand.Read(iv))
-		_, err = writer.Write(iv)
-		if err != nil {
+		if err := buf.WriteAllBytes(writer, iv); err != nil {
 			return nil, newError("failed to write IV.").Base(err)
 		}
 	}
@@ -234,31 +167,20 @@ func WriteTCPResponse(request *protocol.RequestHeader, writer io.Writer) (buf.Wr
 
 func EncodeUDPPacket(request *protocol.RequestHeader, payload []byte) (*buf.Buffer, error) {
 	user := request.User
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, newError("failed to parse account.").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
+	account := user.Account.(*MemoryAccount)
 
 	buffer := buf.New()
 	ivLen := account.Cipher.IVSize()
 	if ivLen > 0 {
-		common.Must(buffer.Reset(buf.ReadFullFrom(rand.Reader, ivLen)))
+		common.Must2(buffer.ReadFullFrom(rand.Reader, ivLen))
 	}
-	iv := buffer.Bytes()
 
-	if err := socks.AppendAddress(buffer, request.Address, request.Port); err != nil {
+	if err := addrParser.WriteAddressPort(buffer, request.Address, request.Port); err != nil {
 		return nil, newError("failed to write address").Base(err)
 	}
 
-	buffer.Append(payload)
+	buffer.Write(payload)
 
-	if !account.Cipher.IsAEAD() && request.Option.Has(RequestOptionOneTimeAuth) {
-		authenticator := NewAuthenticator(HeaderKeyGenerator(account.Key, iv))
-		buffer.SetByte(ivLen, buffer.Byte(ivLen)|0x10)
-
-		common.Must(buffer.AppendSupplier(authenticator.Authenticate(buffer.BytesFrom(ivLen))))
-	}
 	if err := account.Cipher.EncodePacket(account.Key, buffer); err != nil {
 		return nil, newError("failed to encrypt UDP payload").Base(err)
 	}
@@ -266,12 +188,8 @@ func EncodeUDPPacket(request *protocol.RequestHeader, payload []byte) (*buf.Buff
 	return buffer, nil
 }
 
-func DecodeUDPPacket(user *protocol.User, payload *buf.Buffer) (*protocol.RequestHeader, *buf.Buffer, error) {
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return nil, nil, newError("failed to parse account").Base(err).AtError()
-	}
-	account := rawAccount.(*MemoryAccount)
+func DecodeUDPPacket(user *protocol.MemoryUser, payload *buf.Buffer) (*protocol.RequestHeader, *buf.Buffer, error) {
+	account := user.Account.(*MemoryAccount)
 
 	var iv []byte
 	if !account.Cipher.IsAEAD() && account.Cipher.IVSize() > 0 {
@@ -290,65 +208,27 @@ func DecodeUDPPacket(user *protocol.User, payload *buf.Buffer) (*protocol.Reques
 		Command: protocol.RequestCommandUDP,
 	}
 
-	if !account.Cipher.IsAEAD() {
-		if (payload.Byte(0) & 0x10) == 0x10 {
-			request.Option |= RequestOptionOneTimeAuth
-		}
+	payload.SetByte(0, payload.Byte(0)&0x0F)
 
-		if request.Option.Has(RequestOptionOneTimeAuth) && account.OneTimeAuth == Account_Disabled {
-			return nil, nil, newError("rejecting packet with OTA enabled, while server disables OTA").AtWarning()
-		}
-
-		if !request.Option.Has(RequestOptionOneTimeAuth) && account.OneTimeAuth == Account_Enabled {
-			return nil, nil, newError("rejecting packet with OTA disabled, while server enables OTA").AtWarning()
-		}
-
-		if request.Option.Has(RequestOptionOneTimeAuth) {
-			payloadLen := payload.Len() - AuthSize
-			authBytes := payload.BytesFrom(payloadLen)
-
-			authenticator := NewAuthenticator(HeaderKeyGenerator(account.Key, iv))
-			actualAuth := make([]byte, AuthSize)
-			authenticator.Authenticate(payload.BytesTo(payloadLen))(actualAuth)
-			if !bytes.Equal(actualAuth, authBytes) {
-				return nil, nil, newError("invalid OTA")
-			}
-
-			payload.Slice(0, payloadLen)
-		}
+	addr, port, err := addrParser.ReadAddressPort(nil, payload)
+	if err != nil {
+		return nil, nil, newError("failed to parse address").Base(err)
 	}
 
-	addrType := (payload.Byte(0) & 0x0F)
-	payload.SliceFrom(1)
-	switch addrType {
-	case AddrTypeIPv4:
-		request.Address = net.IPAddress(payload.BytesTo(4))
-		payload.SliceFrom(4)
-	case AddrTypeIPv6:
-		request.Address = net.IPAddress(payload.BytesTo(16))
-		payload.SliceFrom(16)
-	case AddrTypeDomain:
-		domainLength := int(payload.Byte(0))
-		request.Address = net.DomainAddress(string(payload.BytesRange(1, 1+domainLength)))
-		payload.SliceFrom(1 + domainLength)
-	default:
-		return nil, nil, newError("unknown address type: ", addrType).AtError()
-	}
-
-	request.Port = net.PortFromBytes(payload.BytesTo(2))
-	payload.SliceFrom(2)
+	request.Address = addr
+	request.Port = port
 
 	return request, payload, nil
 }
 
 type UDPReader struct {
 	Reader io.Reader
-	User   *protocol.User
+	User   *protocol.MemoryUser
 }
 
 func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	buffer := buf.New()
-	err := buffer.AppendSupplier(buf.ReadFrom(v.Reader))
+	_, err := buffer.ReadFrom(v.Reader)
 	if err != nil {
 		buffer.Release()
 		return nil, err
@@ -358,7 +238,7 @@ func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		buffer.Release()
 		return nil, err
 	}
-	return buf.NewMultiBufferValue(payload), nil
+	return buf.MultiBuffer{payload}, nil
 }
 
 type UDPWriter struct {

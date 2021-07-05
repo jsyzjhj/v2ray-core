@@ -1,11 +1,14 @@
+// +build !confonly
+
 package kcp
 
 import (
 	"crypto/cipher"
-
 	"v2ray.com/core/common"
 	"v2ray.com/core/transport/internet"
 )
+
+const protocolName = "mkcp"
 
 // GetMTUValue returns the value of MTU settings.
 func (c *Config) GetMTUValue() uint32 {
@@ -56,7 +59,10 @@ func (c *Config) GetReadBufferSize() uint32 {
 }
 
 // GetSecurity returns the security settings.
-func (*Config) GetSecurity() (cipher.AEAD, error) {
+func (c *Config) GetSecurity() (cipher.AEAD, error) {
+	if c.Seed != nil {
+		return NewAEADAESGCMBasedOnSeed(c.Seed.Seed), nil
+	}
 	return NewSimpleAuthenticator(), nil
 }
 
@@ -97,7 +103,7 @@ func (c *Config) GetReceivingBufferSize() uint32 {
 }
 
 func init() {
-	common.Must(internet.RegisterProtocolConfigCreator(internet.TransportProtocol_MKCP, func() interface{} {
+	common.Must(internet.RegisterProtocolConfigCreator(protocolName, func() interface{} {
 		return new(Config)
 	}))
 }
